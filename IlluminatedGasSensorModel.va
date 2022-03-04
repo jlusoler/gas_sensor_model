@@ -1,0 +1,152 @@
+/************************************************************************
+Copyright (c) 2022 Universitat de Barcelona
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+************************************************************************/
+
+`include "constants.vams"
+`include "disciplines.vams"
+
+module IlluminatedGasSensorModel( rp, rn, gasIn, vled, vss );
+
+// User paramenters
+parameter real LED_RS       = 1e3    ; // LED series resistance
+parameter real LED_RP       = 10e6   ; // LED parallel resistance
+parameter real LED_CP       = 1e-12  ; // LED parallel cap
+parameter real LED_IS       = 500e-12; // LED reverse saturation current
+parameter real LED_N        = 2      ; // LED ideality factor
+parameter real IRR_TP       = 75     ; // Irradiance response pole (time constant)
+parameter real IRR_GAIN     = 1      ; // Irradiance gain
+parameter real IRR_0        = 0.004  ; // Ambient irradiance (W/cm^2)
+parameter real IRR_M        = 409    ; // Irradiance slope (W/(cm^2*A)
+parameter real SENSOR_R0    = 2e9    ; // Sensor resistance in dark conditions
+parameter real SENSOR_R     = 0.5    ; // Static response power Freundlich exponent for oxides
+parameter real RBASE_ALPHA  = 475    ; // Semiconductor base resistance parameter 
+parameter real RBASE_BETA   = 0.66   ; // Semiconductor base resistance parameter
+parameter real GAS_GAINON   = 0.0001 ; // Gas gain when increasing concentration
+parameter real GAS_GAINOFF  = 0.0001 ; // Gas gain when decreasing concentration
+parameter real GAS_T_IRR_OF = 500    ; // Gas time constant dependence with light (offset)
+parameter real GAS_T_IRR_M  = 0.38   ; // Gas time constant dependence with light (slope)
+parameter real GAS_R_T1T2   = 5      ; // Gas ratio between the two poles
+parameter real GAS_R_ONOFF  = 0.1    ; // Gas ratio between rise and fall times
+parameter real SENS_IRRS    = 0.04   ; // Irradiance slope of maximum sensitivity as function of gas conentration
+parameter real SENS_IRRO    = 0.08   ; // Irradiance offset of maximum sensitivity as function of gas concentration
+parameter real SENS_STD     = 1.387  ; // Standard deviation of the sensitivity bell shaped response
+parameter real DRIFT_COEF   = 80     ; // Drift coefficient
+
+// Input / Outputs
+input gasIn; // Gas input
+input vled ; // LED voltage input
+input vss  ; // Reference node
+inout rp   ; // Positive resistance contact
+inout rn   ; // Negative resistance contact
+
+electrical gasIn, vled, rp, rn, vss, vledA, ddt_gas_con, gas_concentration;
+ground gnd;
+
+real led_curr  ; // LED current
+real irr       ; // Irradiance received by the sensor from the LED
+real irr_lp    ; // Irradiance filtered
+real gas_gain  ; // Gas input gain
+real gas_tp1   ; // Gas LPF first pole (in s)
+real gas_tp2   ; // Gas LPF second pole (in s)
+real gas_edge  ; // Derivative of the gas concentration to detect the sign of the variation
+real resp_EmaxS; // Irradiance for which the sensitivity is maximum
+real resp_mean ; // Mean sensitivity of the bell shaped response
+real resp      ; // Sensitivity of the sensor
+real r_base    ; // Sensor resistance due to light effects (gas ignored)
+real g_gas     ; // Conductance change due to gas presence
+real r_drift   ; // Drift resistance component
+real r_total   ; // Total sensor resistance
+
+analog begin
+
+	@(initial_step) begin
+		led_curr = 0;
+		irr = 1;
+		irr_lp = 1;
+		gas_gain = GAS_GAINON;
+		gas_tp1 = GAS_T_IRR_OF;
+		gas_tp2 = GAS_T_IRR_OF;
+		gas_edge = 0;
+		resp_EmaxS = 1;
+		resp_mean = 1;
+		resp = 1;
+		r_base = SENSOR_R0;
+		g_gas = 0;
+		r_drift = 0;
+		r_total = SENSOR_R0;
+	end
+
+	// LED model
+	I(vled, vledA) <+ V(vled,vledA) / LED_RS;
+	I(vledA,vss)   <+ V(vledA,vss) / LED_RP;
+	I(vledA,vss)   <+ LED_CP * ddt(V(vledA,vss));
+	led_curr       =  LED_IS * exp(`P_Q*V(vledA,vss)/(LED_N*`P_K*$temperature));
+	I(vledA,vss)   <+ led_curr;
+
+	// Irradiance
+	irr = IRR_0 + IRR_M*led_curr;
+
+	// Irradiance low pass filter (changes in the semiconductor are not instant)
+	irr_lp = laplace_nd(irr, {IRR_GAIN}, {1,IRR_TP});
+
+	// Light effects on sensor resistance
+	r_base = (SENSOR_R0 / (1 + RBASE_ALPHA*irr_lp**RBASE_BETA));
+
+	// Gas low pass filter (reactions are slow, multiexponential and assymetrical)
+	gas_edge = ddt(V(gasIn,vss)); // finds the derivative in order to know if the concentration is increasing or decreasing
+	if(gas_edge > 0.1) begin // gas concentration increasing
+		gas_gain = GAS_GAINON;
+		gas_tp1  = GAS_T_IRR_OF*(1/irr)**GAS_T_IRR_M;
+	end
+	else if(gas_edge < -0.1) begin // gas concentration decreasing
+		gas_gain = GAS_GAINOFF;
+		gas_tp1  = GAS_T_IRR_OF*(1/irr)**GAS_T_IRR_M *GAS_R_ONOFF;
+	end
+	else begin
+		gas_gain = gas_gain;
+		gas_tp1  = gas_tp1;
+	end
+	gas_tp2 = gas_tp1/GAS_R_T1T2;
+
+	// Multi exponential slews
+	V(ddt_gas_con) <+ ddt(V(gas_concentration)); // Second derivative
+	V(gas_concentration) <+ gas_gain/2*(2*ddt(V(gasIn,vss))+V(gasIn,vss)*(gas_tp1+gas_tp2)) - ddt(V(ddt_gas_con))*gas_tp1*gas_tp2 - ddt(V(gas_concentration))*(gas_tp1+gas_tp2);
+
+	// Sensitivity
+	resp_EmaxS = SENS_IRRS*V(gas_concentration,vss)+SENS_IRRO;
+	resp_mean = ln(resp_EmaxS) + SENS_STD**2;
+	resp = V(gas_concentration,vss)*10*1/(irr_lp * SENS_STD * sqrt(2*`M_PI))*exp(-((ln(irr_lp)-resp_mean)**2)/(2*SENS_STD**2));
+
+	// Conductance variance due to gas presence
+	g_gas = 1/resp/r_base * pow(V(gas_concentration,vss), SENSOR_R);
+
+	// Drift term
+	r_drift = DRIFT_COEF*$abstime;
+
+	// Total resistance
+	r_total = r_base + 1/g_gas + r_drift;
+
+	// Output current proportional to the sensor resistance
+	I(rp,rn) <+ V(rp,rn)/r_total;
+end
+
+endmodule
